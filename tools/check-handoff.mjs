@@ -9,16 +9,18 @@
  *   在文档里写「请 grep 这个串」，文档本身就含那个串，于是每次自检都命中自己，
  *   要么误报、要么逼人把警告当噪音忽略。所以把模式集中放在脚本里，并排除自身。
  *
- * 检查四类：
- *   1. 平台登录 token 前缀（UC_TOKEN-）与长 hex/数字串
+ * 检查五类：
+ *   1. 平台登录 token（UC_TOKEN- / UC_AUTH-）与长 hex/数字串
  *   2. 11 位以上的连续数字（平台 userId 是 12 位）
  *   3. 常见凭据字段后被赋值的长串（token= / cookie: / authorization:）
  *   4. 本不该出现在交付包里的路径（out/、node_modules/、profile 目录）
+ *   5. 批处理文件行尾 —— 磁盘上的与**提交进仓库的 blob** 都查（两回事，见下）
  *
  * 退出码：0 = 干净；1 = 有发现（此时不要发包）。
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -195,6 +197,55 @@ function checkBatchLineEndings(root) {
   return bad;
 }
 
+/**
+ * 检查**提交进仓库的 blob** 的行尾，而不只是磁盘上的文件。
+ *
+ * ★ 为什么需要这一层 —— 正是踩过才加的：
+ *   `.gitattributes` 里写 `*.bat text eol=crlf` 时，磁盘上的 start.bat 是 CRLF，
+ *   于是上面那个工作区检查**通过**、报告「可以发包」；但 `text` 会先把 CRLF
+ *   **归一成 LF 存进 blob**，`eol=crlf` 只在【检出】那一刻还原。后果：
+ *     · git clone       → 拿到 CRLF（侥幸对）
+ *     · raw.githubusercontent.com / 网页「复制原文」 → 拿到 **LF**（start.bat 直接不能用）
+ *   工作区绿、仓库红，是两回事。修法是把批处理声明为 `-text`（不做归一化）。
+ *
+ * 用 `git show :<path>` 读**索引版本** —— 那才是下一次 commit/push 真正会发出去的东西。
+ * 不在 git 仓库里（比如扫一个解压出来的交付包）就静默跳过，不是错误。
+ */
+function checkBatchBlobs(root) {
+  const gitq = (args) =>
+    execFileSync('git', args, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+
+  let tracked;
+  try {
+    if (gitq(['rev-parse', '--is-inside-work-tree']).trim() !== 'true') return null;
+    tracked = gitq(['ls-files']).split('\n').filter((f) => /\.(bat|cmd)$/i.test(f));
+  } catch {
+    return null; // 不是 git 仓库 / 没有 git —— 跳过，不下结论
+  }
+
+  const bad = [];
+  for (const rel of tracked) {
+    let blob;
+    try {
+      blob = execFileSync('git', ['show', `:${rel}`], {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      continue;
+    }
+    const s = blob.toString('latin1');
+    const crlf = (s.match(/\r\n/g) || []).length;
+    const lf = (s.match(/\n/g) || []).length;
+    if (lf > 0 && crlf < lf) bad.push({ rel, crlf, lf });
+  }
+  return bad;
+}
+
 for (const file of walk(ROOT)) {
   const rel = path.relative(ROOT, file);
   let text;
@@ -282,6 +333,7 @@ if (shipWarnings.length) {
 }
 
 // ── 行尾检查（.bat 存成 LF 会让工具整个不可用）──
+// 分两层：磁盘上的文件（交付包是按文件夹复制的） + 提交进仓库的 blob（GitHub 上那份）。
 const batchBad = checkBatchLineEndings(ROOT);
 if (batchBad.length) {
   console.log('🔴 批处理文件行尾不是 CRLF —— 这会让它**根本无法运行**，必须先修：\n');
@@ -292,16 +344,30 @@ if (batchBad.length) {
   console.log('     修：把文件转成 CRLF（每个换行前补 \\r），别只改编辑器设置就算。\n');
 }
 
+const blobBad = checkBatchBlobs(ROOT) || [];
+if (blobBad.length) {
+  console.log('🔴 **提交进仓库的**批处理 blob 行尾是 LF（磁盘上却是 CRLF，所以上一项检查看不出来）：\n');
+  for (const b of blobBad) {
+    console.log(`  ${b.rel}  （blob 里 CRLF ${b.crlf} 行 / LF ${b.lf} 行）`);
+  }
+  console.log('\n     从 GitHub 网页「复制原文」或 raw 链接拿到的就是这份 —— 同样是坏的。');
+  console.log('     原因多半是 .gitattributes 把批处理写成了 `text eol=crlf`：');
+  console.log('       `text` 会先归一成 LF 存进 blob，`eol=crlf` 只在检出时还原。');
+  console.log('     修：改成 `*.bat -text` / `*.cmd -text`，然后 `git add --renormalize .`。\n');
+}
+
+const eolBad = batchBad.length + blobBad.length;
+
 if (!findings.length) {
   console.log('✅ 源码里没有发现个人凭据。');
-  if (batchBad.length) {
+  if (eolBad) {
     console.log('   ❌ 但上面的批处理行尾问题必须先修 —— 修完再发。\n');
   } else if (shipWarnings.length) {
     console.log('   （但上面那几个目录仍需排除，别用「压缩整个文件夹」。）\n');
   } else {
     console.log('   可以发包。\n');
   }
-  process.exit(batchBad.length ? 1 : 0);
+  process.exit(eolBad ? 1 : 0);
 }
 
 console.log(`🔴 发现 ${findings.length} 处可疑内容 —— 先处理掉再发：\n`);
