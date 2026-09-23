@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="教师研修 · 自动挂课">
+  <title>教师研修 · 自动挂课</title>
+
+  <defs>
+    <!-- 品牌蓝：取自界面主按钮 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4C86FF"/>
+      <stop offset="0.55" stop-color="#2F6BFF"/>
+      <stop offset="1" stop-color="#1B45C4"/>
+    </linearGradient>
+
+    <!-- 顶部高光，让方块有体积感而不是一块死色 -->
+    <radialGradient id="gloss" cx="0.32" cy="0.16" r="0.9">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 进度环的投影，压出「环浮在底色上」的层次 -->
+    <filter id="ringShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#0A2260" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- 底板 -->
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="url(#gloss)"/>
+
+  <!--
+    进度环：留出 1/4 缺口（左上，9 点钟 ~ 12 点钟）= 「还在挂」，不是「已完成」。
+    周长 2πr = 2π×134 ≈ 841.9；走 3/4 ≈ 631
+  -->
+  <g filter="url(#ringShadow)">
+    <circle cx="256" cy="256" r="134" fill="none"
+            stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="30"/>
+    <circle cx="256" cy="256" r="134" fill="none"
+            stroke="#FFFFFF" stroke-width="30" stroke-linecap="round"
+            stroke-dasharray="631 842"
+            transform="rotate(-90 256 256)"/>
+  </g>
+
+  <!--
+    播放三角，居中（整个图案的重心就是这个三角）。
+    带同色描边 = 圆角，纯 fill 的尖角在小尺寸下会显硬。
+    几何重心 x=(222+222+334)/3≈259，刻意比中心 256 略偏右：
+    三角形几何居中时，人眼会看成偏左。
+    尺寸校验：环内缘半径 119，x=346 处可用半高 √(119²−90²)≈78 即 y=178~334，
+    三角描边后占 y=180~332，刚好留一线余量 —— 再大就会顶到环。
+  -->
+  <path d="M222 192 L222 320 L334 256 Z"
+        fill="#FFFFFF" stroke="#FFFFFF" stroke-width="24" stroke-linejoin="round"/>
+</svg>

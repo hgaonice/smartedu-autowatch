@@ -1,0 +1,31 @@
+# ── 依赖 ──
+node_modules/
+
+# ── 运行产物 ──
+# out/ 里是运行日志与探测结果，**可能含个人 userId / 登录 token**。
+# 例如 out/*-recon.json、out/run-*.log 会原样记录平台返回的鉴权信息。
+# 这类文件一律不入库、不随包分发。
+out/
+*.log
+*.jsonl
+
+# ── 个人凭据 / 本机状态 ──
+# 独立 Chrome profile（含登录态与 Widevine CDM），绝不入库
+.chrome-profile/
+*.crx
+# 进程锁（含本机 PID）
+*.lock
+# 本地环境覆盖（如果将来支持读 .env）
+.env
+.env.local
+
+# ── 打包产物 ──
+dist/
+build/
+*.exe
+
+# ── 编辑器 / 系统 ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

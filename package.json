@@ -1,0 +1,29 @@
+{
+  "name": "smartedu-autowatch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "国家中小学智慧教育平台 · 教师研修自动挂课（本地 Web UI + chrome --app 桌面外壳）",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "ui": "node src/web/launch.mjs",
+    "serve": "node src/web/serve-only.mjs",
+    "list": "node src/run.mjs --list",
+    "login": "node src/run.mjs --login",
+    "probe": "node src/probe.mjs",
+    "watch": "node src/run.mjs",
+    "watch:headless": "node src/run.mjs --headless",
+    "monitor": "node tools/watch.mjs",
+    "selftest": "node tools/selftest.mjs",
+    "test:web": "node tools/test-web.mjs",
+    "test:stop": "node tools/test-stop-logic.mjs",
+    "test": "node tools/test-stop-logic.mjs && node tools/test-web.mjs",
+    "check:handoff": "node tools/check-handoff.mjs",
+    "check": "node --check userscript/smartedu-autowatch.user.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

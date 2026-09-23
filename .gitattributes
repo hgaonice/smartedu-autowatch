@@ -1,0 +1,30 @@
+# 换行符策略 —— 写死在仓库层，不依赖各人本地的 core.autocrlf。
+#
+# 为什么必须显式写：本项目已被行尾坑过一次 —— start.bat 曾经是 LF 行尾，
+# 双击直接不能用（cmd.exe 按【字节偏移】读批处理且期望 CRLF，LF-only 会读错位、
+# 把半行当命令），而当时从文件内容上完全看不出问题。
+# 工具里也有对应拦截：tools/check-handoff.mjs 的 checkBatchLineEndings()。
+
+# 其余文本：仓库内存 LF，检出后按平台处理
+* text=auto eol=lf
+
+# 批处理：**不做任何归一化**，CRLF 字节原样存进 blob。
+#
+# ★ 为什么不是 `text eol=crlf`：`text` 会把 CRLF **归一成 LF 存进仓库**，
+#   `eol=crlf` 只在【检出】那一刻还原。结果是 —— git clone 拿到 CRLF（侥幸对），
+#   但 raw.githubusercontent.com、GitHub 网页「复制原文」、以及任何直接取 blob
+#   的路径拿到的都是 **LF**，而那会让 start.bat 完全无法运行。
+#   实测踩到：首版这么写，公网上 raw 出来的 start.bat 是 CRLF 0 / 裸 LF 46。
+#
+#   `-text` = 当作二进制不碰，磁盘上是 CRLF 就存 CRLF —— 所有取用路径都一致。
+*.bat -text
+*.cmd -text
+
+# 二进制：别让 git 做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
