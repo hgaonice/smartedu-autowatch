@@ -77,6 +77,25 @@
   .banner.warn{background:#fffbeb;border:1px solid #fde68a;color:#7c4a03}
   .banner.err{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
   .banner.ok{background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+
+  /* 账号与进度 */
+  .acct-head{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600}
+  .acct-head .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .acct-head.ok{color:var(--ok)} .acct-head.ok .dot{background:var(--ok)}
+  .acct-head.off{color:var(--err)} .acct-head.off .dot{background:var(--err)}
+  .acct-sub{color:var(--dim);font-size:12.5px;margin-top:5px}
+  .acct-sub.warn{color:var(--warn)}
+  .bar{height:8px;background:#eef1f4;border-radius:999px;overflow:hidden;margin:11px 0 2px}
+  .bar>i{display:block;height:100%;background:var(--accent);border-radius:999px;
+         transition:width .4s ease}
+  .acct-courses{margin-top:11px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .acct-course{display:flex;align-items:center;gap:10px;padding:7px 12px;
+               border-top:1px solid #f0f2f4;font-size:13px}
+  .acct-course:first-child{border-top:none}
+  .acct-course .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .acct-course .p{color:var(--dim);font-size:12.5px;flex:none;font-variant-numeric:tabular-nums}
+  .acct-course.done .t,.acct-course.done .p{color:var(--ok)}
+  .acct-course.done .p{font-weight:600}
 </style>
 </head>
 <body>
@@ -87,6 +106,11 @@
   </header>
 
   <div id="banner"></div>
+
+  <div class="card">
+    <div class="step">账号与进度</div>
+    <div id="acctBody"><div class="acct-sub">正在读取…</div></div>
+  </div>
 
   <div class="card">
     <div class="step"><span class="num">1</span>选择专题 <span class="hint" id="siteHint"></span></div>
@@ -106,7 +130,7 @@
   </div>
 
   <div class="card">
-    <div class="step"><span class="num">3</span>设置 <span class="hint">不懂就别改，默认就行</span></div>
+    <div class="step"><span class="num">3</span>设置 <span class="hint">不确定的话，保持默认就好</span></div>
     <div class="row">
       <div class="field"><label>目标学时</label><input type="number" id="hours" value="10" min="1" max="200" step="0.5"></div>
       <div class="field"><label>播放倍速</label><input type="number" id="rate" value="2" min="1" max="16" step="0.5"></div>
@@ -119,6 +143,7 @@
     <div class="actions">
       <button class="primary" id="start">开始挂课</button>
       <button id="login">先登录（只需一次）</button>
+      <button id="switchacct">切换账号</button>
       <button class="danger" id="stop" disabled>停止</button>
       <span class="status" id="status">就绪</span>
     </div>
@@ -133,18 +158,41 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let sites = [], curSite = null, targets = [], courses = [], lastSeq = 0, running = false;
+let lastKind = 'watch'; // 最近一次启动的任务是挂课还是登录（决定结束语）
+let acctBusy = false;   // 防止账号卡片的轮询重入
 
-const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 const fmt = (n) => (n == null ? '—' : (Math.round(n * 100) / 100).toString());
 
-function banner(kind, html) {
-  $('banner').innerHTML = html ? `<div class="banner ${kind}">${html}</div>` : '';
+/** 建一个元素（一律走 textContent，不把数据当 HTML 注入） */
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+function banner(kind, text) {
+  const host = $('banner');
+  host.textContent = '';
+  if (text) host.appendChild(el('div', 'banner ' + kind, text));
+}
+
+/** 本地时间 HH:MM:SS（日志行时间戳） */
+function nowClock() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 function addLine(l) {
   const el = document.createElement('div');
   el.className = 'l-' + (l.kind || 'out');
-  el.textContent = l.text;
+  // 每行统一显示本地时间：
+  //  · 优先用服务端记录的 l.at（准确，含断线重连的回放）
+  //  · 没有就退回「本行到达界面的时间」
+  //  · 同时剥掉 run.mjs 自带的 [HH:MM:SS]（旧版是 UTC，比本机时间少 8 小时，看着对不上）
+  const text = String(l.text ?? '').replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '');
+  el.textContent = `[${l.at || nowClock()}] ${text}`;
   $('log').appendChild(el);
   $('log').scrollTop = $('log').scrollHeight;
 }
@@ -162,6 +210,7 @@ async function boot() {
   curSite = sites[0].id;
   $('siteHint').textContent = sites.length > 1 ? '' : (sites[0].name + ' · ' + sites[0].hint);
   await loadTargets();
+  await loadAccount();
   const st = await api('/api/status');
   for (const l of st.lines) addLine(l);
   lastSeq = st.seq;
@@ -170,12 +219,20 @@ async function boot() {
 }
 
 async function loadTargets() {
-  $('targetMeta').innerHTML = '<span class="chip gray">正在读取…</span>';
+  const meta = $('targetMeta');
+  meta.textContent = '';
+  meta.appendChild(el('span', 'chip gray', '正在读取…'));
   const r = await api('/api/targets?site=' + encodeURIComponent(curSite));
   targets = r.targets;
-  $('target').innerHTML = targets.map((t) =>
-    `<option value="${t.id}"${t.available ? '' : ' disabled'}>` +
-    `${t.available ? (t.title || t.id) : (t.id + '（暂时读不到，可能已结束）')}</option>`).join('');
+  const sel = $('target');
+  sel.textContent = '';
+  for (const t of targets) {
+    const o = document.createElement('option');
+    o.value = t.id;
+    o.disabled = !t.available;
+    o.textContent = t.available ? (t.title || t.id) : (t.id + '（暂时读不到，可能已结束）');
+    sel.appendChild(o);
+  }
   const first = targets.find((t) => t.available);
   if (first) {
     $('target').value = first.id;
@@ -186,45 +243,65 @@ async function loadTargets() {
 }
 
 function showMeta() {
+  const host = $('targetMeta');
+  host.textContent = '';
   const t = targets.find((x) => x.id === $('target').value);
-  if (!t) return $('targetMeta').innerHTML = '';
+  if (!t) return;
   const chips = [];
   if (t.available) {
-    chips.push(`<span class="chip">${t.courseIds.length} 门课</span>`);
-    if (t.maxPeriod) chips.push(`<span class="chip">目标 ${t.maxPeriod} 学时</span>`);
-    if (t.studyEnd) chips.push(`<span class="chip">截止 ${String(t.studyEnd).slice(0, 10)}</span>`);
-    if (t.phaseTitles.length) chips.push(`<span class="chip gray">${t.phaseTitles.join(' / ')}</span>`);
+    chips.push({ text: `${t.courseIds.length} 门课` });
+    if (t.maxPeriod) chips.push({ text: `目标 ${t.maxPeriod} 学时` });
+    if (t.studyEnd) chips.push({ text: `截止 ${String(t.studyEnd).slice(0, 10)}` });
+    if (t.phaseTitles.length) chips.push({ text: t.phaseTitles.join(' / '), gray: true });
   } else {
-    chips.push(`<span class="chip gray">读取失败：${t.error || ''}</span>`);
+    chips.push({ text: `读取失败：${t.error || ''}`, gray: true });
   }
-  $('targetMeta').innerHTML = chips.join('');
+  for (const c of chips) host.appendChild(el('span', 'chip' + (c.gray ? ' gray' : ''), c.text));
+}
+
+/** 课程区只显示一行提示（读取中 / 出错），一律 textContent */
+function showCoursesMsg(text, color) {
+  const host = $('courses');
+  host.textContent = '';
+  const row = el('div', 'item');
+  const span = el('span', 't', text);
+  span.style.color = color;
+  row.appendChild(span);
+  host.appendChild(row);
 }
 
 async function loadCourses() {
   const t = $('target').value;
-  $('courses').innerHTML = '<div class="item"><span class="t" style="color:#6b7280">正在读取课程列表…</span></div>';
+  showCoursesMsg('正在读取课程列表…', '#6b7280');
   try {
     const r = await api(`/api/courses?site=${encodeURIComponent(curSite)}&target=${encodeURIComponent(t)}`);
     courses = r.courses;
     renderCourses();
   } catch (e) {
     courses = [];
-    $('courses').innerHTML = `<div class="item"><span class="t" style="color:#b91c1c">读取课程失败：${esc(e.message)}</span></div>`;
+    showCoursesMsg('读取课程失败：' + e.message, '#b91c1c');
   }
 }
 
 function renderCourses() {
-  $('courses').innerHTML = courses.map((c, i) => {
+  const host = $('courses');
+  host.textContent = '';
+  courses.forEach((c, i) => {
     const cap = Number(c.maxPeriod);
     const per = c.totalPeriod != null ? `${fmt(c.totalPeriod)} 学时` : '';
     const tag = cap > 0 ? `可计入 ${cap}` : '不限';
-    return `<label class="item" data-i="${i}">
-      <input type="checkbox" checked data-id="${c.courseId}">
-      <span class="t">${esc(c.title)}</span>
-      <span class="p">${per} · ${tag}</span></label>`;
-  }).join('');
-  $('courses').querySelectorAll('input[type=checkbox]')
-    .forEach((cb) => cb.addEventListener('change', updateSel));
+    const label = el('label', 'item');
+    label.dataset.i = String(i);
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.id = c.courseId;
+    cb.addEventListener('change', updateSel);
+    label.appendChild(cb);
+    label.appendChild(el('span', 't', c.title));
+    label.appendChild(el('span', 'p', `${per} · ${tag}`));
+    host.appendChild(label);
+  });
   updateSel();
 }
 
@@ -236,20 +313,110 @@ function updateSel() {
   $('selInfo').textContent = boxes.length ? `已选 ${n} / ${boxes.length} 门 · 合计 ${fmt(sec)} 学时` : '';
 }
 
+/** 当前选中的专题目标学时（进度条分母）；没有就不画条 */
+function targetMaxPeriod() {
+  const t = targets.find((x) => x.id === $('target').value);
+  return t && Number(t.maxPeriod) > 0 ? Number(t.maxPeriod) : 0;
+}
+
+/** 渲染账号与各课进度：未登录就只提示登录 */
+function renderAccount(a) {
+  const host = $('acctBody');
+  host.textContent = '';
+
+  if (!a || !a.loggedIn) {
+    const head = el('div', 'acct-head off');
+    head.appendChild(el('span', 'dot'));
+    head.appendChild(document.createTextNode('还没登录'));
+    host.appendChild(head);
+    host.appendChild(el('div', 'acct-sub',
+      '请点下方的「先登录（只需一次）」完成登录 —— 登录后这里会显示账号和各门课的进度。'));
+    return;
+  }
+
+  const head = el('div', 'acct-head ok');
+  head.appendChild(el('span', 'dot'));
+  head.appendChild(document.createTextNode('已登录 · 账号 ' + (a.userId || '（未知）')));
+  host.appendChild(head);
+  if (a.savedAt) {
+    host.appendChild(el('div', 'acct-sub', '上次登录记录：' + new Date(a.savedAt).toLocaleString('zh-CN')));
+  }
+
+  if (a.progressError) {
+    host.appendChild(el('div', 'acct-sub warn', '进度暂时读不到（' + a.progressError + '）—— 不影响挂课。'));
+    return;
+  }
+  const cs = a.courses;
+  if (!cs || !cs.length) {
+    host.appendChild(el('div', 'acct-sub', '已登录，但暂时没拿到课程进度。'));
+    return;
+  }
+
+  const max = targetMaxPeriod();
+  const pct = max > 0 ? Math.min(100, Math.round((a.certifiedTotal / max) * 100)) : 0;
+  if (max > 0) {
+    const bar = el('div', 'bar');
+    const fill = el('i');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    host.appendChild(bar);
+    host.appendChild(el('div', 'acct-sub',
+      `已认定 ${a.certifiedTotal} / ${max} 学时（${pct}%）· 已学习合计 ${a.learnedTotal} 学时`));
+  } else {
+    host.appendChild(el('div', 'acct-sub',
+      `已学习合计 ${a.learnedTotal} 学时 · 已认定 ${a.certifiedTotal} 学时`));
+  }
+
+  const list = el('div', 'acct-courses');
+  for (const c of cs) {
+    const done = c.capPeriod > 0 && c.certifiedPeriod >= c.capPeriod;
+    const row = el('div', 'acct-course' + (done ? ' done' : ''));
+    row.appendChild(el('span', 't', c.title));
+    const cap = c.capPeriod > 0 ? `上限 ${c.capPeriod}` : '不限';
+    row.appendChild(el('span', 'p', `${done ? '✅ 已认满 · ' : ''}已学习 ${c.learnedPeriod} · ${cap}`));
+    list.appendChild(row);
+  }
+  host.appendChild(list);
+}
+
+/** 拉取账号与进度（纯本地 HTTP，不碰浏览器，挂课中也能刷） */
+async function loadAccount() {
+  if (acctBusy) return;
+  acctBusy = true;
+  try {
+    const t = $('target') ? $('target').value : '';
+    const a = await api(`/api/account?site=${encodeURIComponent(curSite)}&target=${encodeURIComponent(t)}`);
+    renderAccount(a);
+  } catch {
+    renderAccount(null);
+  } finally {
+    acctBusy = false;
+  }
+}
+
 function setRunning(on) {
   running = on;
   $('start').disabled = on;
   $('login').disabled = on;
+  $('switchacct').disabled = on;
   $('stop').disabled = !on;
-  $('status').innerHTML = on ? '<span class="spin"></span>挂课中…' : (running === false ? '就绪' : '');
+  const st = $('status');
+  st.textContent = '';
+  if (on) {
+    st.appendChild(el('span', 'spin'));
+    st.appendChild(document.createTextNode('挂课中…'));
+  } else {
+    st.textContent = '就绪';
+  }
 }
 
 // ── 操作 ──────────────────────────────────────────────
 $('all').onclick = () => { $('courses').querySelectorAll('input[type=checkbox]').forEach((b) => (b.checked = true)); updateSel(); };
 $('none').onclick = () => { $('courses').querySelectorAll('input[type=checkbox]').forEach((b) => (b.checked = false)); updateSel(); };
-$('target').onchange = () => { showMeta(); loadCourses(); };
+$('target').onchange = () => { showMeta(); loadCourses(); loadAccount(); };
 
 $('start').onclick = async () => {
+  lastKind = 'watch';
   const picked = [...$('courses').querySelectorAll('input[type=checkbox]')].filter((b) => b.checked).map((b) => b.dataset.id);
   if (!picked.length) return banner('err', '请至少勾选一门课程。');
   if (picked.length < courses.length) {
@@ -260,7 +427,7 @@ $('start').onclick = async () => {
   } else banner('', '');
   try {
     setRunning(true);
-    $('log').innerHTML = ''; lastSeq = 0;
+    $('log').textContent = ''; lastSeq = 0;
     await api('/api/start', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -269,42 +436,62 @@ $('start').onclick = async () => {
         headful: $('headful').checked,
       }),
     });
-  } catch (e) { setRunning(false); banner('err', '启动失败：' + esc(e.message)); }
+  } catch (e) { setRunning(false); banner('err', '启动失败：' + e.message); }
 };
 
 $('login').onclick = async () => {
   try {
+    lastKind = 'login';
     setRunning(true);
-    banner('warn', '已打开登录窗口 —— 请在里面用手机扫码或输入账号密码登录。<b>登录成功后会自己继续，不用回来点任何东西。</b>（只需做这一次，以后会自动记住）');
+    banner('warn', '已打开登录窗口 —— 请在里面用手机扫码或输入账号密码登录。登录成功后会自己继续，不用回来点任何东西。（只需做这一次，以后会自动记住）');
     await api('/api/start', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ site: curSite, target: '__login__', login: true, headful: true }),
     });
-  } catch (e) { setRunning(false); banner('err', '打开登录窗口失败：' + esc(e.message)); }
+  } catch (e) { setRunning(false); banner('err', '打开登录窗口失败：' + e.message); }
+};
+
+$('switchacct').onclick = async () => {
+  try {
+    lastKind = 'login';
+    setRunning(true);
+    banner('warn', '正在清除旧登录态并打开登录窗口 —— 请在弹出的窗口里用新账号登录。登录成功后会自己继续，不用回来点任何东西。');
+    await api('/api/start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ site: curSite, target: '__switch__', switchAccount: true, headful: true }),
+    });
+  } catch (e) { setRunning(false); banner('err', '打开登录窗口失败：' + e.message); }
 };
 
 $('stop').onclick = async () => {
   banner('', '');
-  try { await api('/api/stop', { method: 'POST' }); } catch (e) { banner('err', esc(e.message)); }
+  try { await api('/api/stop', { method: 'POST' }); } catch (e) { banner('err', e.message); }
 };
 
 // ── 日志 SSE ──────────────────────────────────────────
 function attachLog() {
   const es = new EventSource('/api/log?after=' + lastSeq);
   es.onmessage = (ev) => {
-    const l = JSON.parse(ev.data);
+    let l;
+    try { l = JSON.parse(ev.data); } catch { return; } // 坏帧直接丢弃，别让 SSE 把界面打挂
     if (l.seq <= lastSeq) return;
     lastSeq = l.seq;
     addLine(l);
-    if (l.text.includes('已正常结束')) { setRunning(false); banner('ok', '✅ 挂完了。可以关掉这个窗口。'); }
-    else if (l.text.startsWith('⚠️')) { setRunning(false); banner('warn', esc(l.text)); }
-    else if (l.text.includes('环境不满足')) { setRunning(false); banner('err', esc(l.text) + '　请按日志里的提示处理后重开。'); }
+    if (l.text.includes('已正常结束')) {
+      setRunning(false);
+      if (lastKind === 'login') { banner('ok', '✅ 登录已完成 —— 账号与进度已更新。'); loadAccount(); }
+      else { banner('ok', '✅ 挂完了。可以关掉这个窗口。'); loadAccount(); }
+    }
+    else if (l.text.includes('⚠️')) { setRunning(false); banner('warn', l.text); }
+    else if (l.text.includes('环境不满足')) { setRunning(false); banner('err', l.text + '　请按日志里的提示处理后重开。'); }
   };
   es.onerror = () => { es.close(); setTimeout(attachLog, 2500); };
 }
 
-boot().catch((e) => banner('err', '初始化失败：' + esc(e.message)));
+boot().catch((e) => banner('err', '初始化失败：' + e.message));
 attachLog();
+// 进度会随挂课推进，定时刷新一下（纯本地 HTTP，不碰浏览器）
+setInterval(loadAccount, 20_000);
 </script>
 </body>
 </html>

@@ -16,6 +16,7 @@
  *   GET  /api/sites            可选挂课类型
  *   GET  /api/targets?site=    可挂专题（免登录）
  *   GET  /api/courses?site=&target=  专题下的课程 + 各自已认定学时
+ *   GET  /api/account?site=&target=  登录账号信息 + 各课进度（未登录则 loggedIn=false）
  *   POST /api/start            开始挂课（spawn run.mjs）
  *   POST /api/stop             停掉挂课
  *   GET  /api/status           当前任务状态 + 日志快照
@@ -28,6 +29,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { SITES, getSite } from '../sites/index.mjs';
+import { readAccount, maskUserId } from '../account.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(DIR, '..', '..');
@@ -39,6 +41,13 @@ const MAX_LINES = 3000;
 // ────────────────────────────────────────────────────────────
 //  当前挂课任务（单实例：一次只跑一个，profile 是独占资源）
 // ────────────────────────────────────────────────────────────
+/** 本地时间 HH:MM:SS（日志行时间戳，与 run.mjs 的 stamp / 界面同格式） */
+function nowClock() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 class Job {
   constructor() {
     this.proc = null;
@@ -56,7 +65,8 @@ class Job {
   }
 
   push(text, kind = 'out') {
-    const line = { seq: ++this.seq, text, kind };
+    // 记录本行产生的本地时间，界面日志据此显示时间戳（断线重连回放也不会错）。
+    const line = { seq: ++this.seq, text, kind, at: nowClock() };
     this.lines.push(line);
     if (this.lines.length > MAX_LINES) this.lines.splice(0, this.lines.length - MAX_LINES);
     const payload = `data: ${JSON.stringify(line)}\n\n`;
@@ -146,16 +156,22 @@ function startJob(args) {
 
 function stopJob() {
   if (!job.running) return { stopped: false, reason: '当前没有在跑的任务' };
-  const pid = job.proc.pid;
+  // ★ 必须在**调用时**把目标进程固定下来，不能在 setTimeout 回调里读 `job.proc`。
+  //   旧写法：8 秒后读 job.proc —— 若用户在这 8 秒内又点了「开始挂课」，
+  //   job.proc 已经指向**新任务**，于是这个「补刀」会把刚启动的新任务杀掉。
+  //   表现：停下后立刻重开 → 新任务刚登录就静默退出、退出码 null（就是这次的现场）。
+  const proc = job.proc;
+  const pid = proc.pid;
   job.push(`⏹ 正在停止（PID ${pid}）…`, 'cmd');
   // 先礼后兵：SIGTERM 让 run.mjs 的清理钩子释放 profile 锁；不行再强杀
   try {
-    job.proc.kill('SIGTERM');
+    proc.kill('SIGTERM');
   } catch {}
   setTimeout(() => {
-    if (job.running) {
+    // 只对「当初那一个」补刀，且确认它确实还没退出
+    if (proc.exitCode === null && proc.signalCode === null) {
       try {
-        job.proc.kill('SIGKILL');
+        proc.kill('SIGKILL');
       } catch {}
     }
   }, 8000);
@@ -261,14 +277,59 @@ async function handle(req, res, url) {
     return json(res, 200, { site: site.id, target: trainId, courses });
   }
 
+  if (req.method === 'GET' && p === '/api/account') {
+    // 登录态与进度全部来自本地缓存 + 免鉴权接口，**不碰浏览器** ——
+    // browser profile 是独占资源，挂课时不能为了刷一个数字去抢。
+    // 缓存（account-<site>.json）由 run.mjs 在登录/挂课时写入。
+    const site = getSite(url.searchParams.get('site'));
+    const acc = readAccount(site.id);
+    if (!acc) return json(res, 200, { site: site.id, loggedIn: false });
+
+    const base = {
+      site: site.id,
+      loggedIn: true,
+      userId: maskUserId(acc.userId),
+      savedAt: acc.savedAt,
+    };
+
+    // 没指定专题就用上次抓到 userId 的那个
+    const targetId = url.searchParams.get('target') || acc.trainId;
+    if (!targetId) return json(res, 200, { ...base, courses: null });
+
+    try {
+      const courses = await site.listCourses(targetId);
+      const r = await site.pollProgress({ trainId: targetId, userId: acc.userId });
+      if (!r.ok) return json(res, 200, { ...base, target: targetId, progressError: r.error });
+      const cert = site.certify(courses, r.map);
+      return json(res, 200, {
+        ...base,
+        target: targetId,
+        learnedTotal: cert.learnedTotal,
+        certifiedTotal: cert.certifiedTotal,
+        courses: cert.rows.map((c) => ({
+          courseId: c.courseId,
+          title: c.title,
+          learnedPeriod: c.learnedPeriod,
+          capPeriod: c.capPeriod,
+          certifiedPeriod: c.certifiedPeriod,
+        })),
+      });
+    } catch (e) {
+      return json(res, 200, { ...base, target: targetId, progressError: String(e?.message || e) });
+    }
+  }
+
   if (req.method === 'POST' && p === '/api/start') {
     if (job.running) return json(res, 409, { error: '已经有一批在挂了' });
     const b = await readBody(req);
     const site = getSite(b.site);
 
     // 「登录」是一种特殊任务：不开课，只把 Chrome 打开让人扫码，登录态存进 profile。
-    if (b.login) {
-      return json(res, 200, { ...startJob(['--site', site.id, '--login']), login: true });
+    // 「切换账号」是它的加强版：先把 profile 里的旧登录态清掉，再进登录页
+    // （不清的话登录流程一看到「已登录」就会收工，窗口刚弹出就被关掉）。
+    if (b.login || b.switchAccount) {
+      const flag = b.switchAccount ? '--switch-account' : '--login';
+      return json(res, 200, { ...startJob(['--site', site.id, flag]), login: true });
     }
 
     if (!b.target) return json(res, 400, { error: '缺少 target（专题 id）' });

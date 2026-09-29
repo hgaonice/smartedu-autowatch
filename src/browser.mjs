@@ -348,6 +348,33 @@ export async function loginState(page) {
   });
 }
 
+/**
+ * 清掉专用 profile 里的平台登录态。
+ *
+ * 用途：切换账号。不清的话，浏览器一打开就带着旧账号，而登录流程一旦看到
+ * 「已登录」就会收工关窗口 —— 用户看到的就是「窗口刚弹出就消失」，换不了号。
+ * cookie 决定 UC_TOKEN，localStorage 里也存着 auth 键，只清一边仍可能被判为已登录。
+ * 该 profile 只服务这一个站点，所以整体清空是安全的。
+ *
+ * @param {import('playwright-core').BrowserContext} context
+ * @param {import('playwright-core').Page} page 需要已停在平台域名下（localStorage 按 origin 隔离）
+ */
+export async function clearSiteSession(context, page) {
+  try {
+    await page.evaluate(() => {
+      try {
+        localStorage.clear();
+      } catch {}
+      try {
+        sessionStorage.clear();
+      } catch {}
+    });
+  } catch {
+    // 页面可能已经关了；cookie 清掉也足够退出登录
+  }
+  await context.clearCookies();
+}
+
 // ----------------------------------------------------------------
 // 瞬时可恢复的网络错误
 // ----------------------------------------------------------------

@@ -18,7 +18,12 @@
  *  本类型的两个固定 URL 形态
  * ════════════════════════════════════════════════════════════════════════
  *   专题页   https://basic.smartedu.cn/training/<trainId>
- *   课程页   https://basic.smartedu.cn/teacherTraining/courseIndex?courseId=<courseId>
+ *   课程页   https://basic.smartedu.cn/teacherTraining/courseDetail?courseId=<courseId>
+ *
+ *   ⚠️ 课程页必须是 **courseDetail**，不能是 courseIndex：
+ *      · courseDetail → 课程详情页，内嵌 <video> 播放器（实测 videoCount=1）
+ *      · courseIndex  → 课程落地页，只有目录/「继续学习」，实测 videoCount=0
+ *        引擎找不到 video，会一直卡在 00:00（就是「挂课不动」的根因）
  *
  * 两个都是 SPA 客户端路由（实测各返回 6544B 的同一个壳，HTTP 200），
  * 所以「拼对 URL」完全等价于「打开平台正确页面」。
@@ -47,7 +52,9 @@ export const teacherTraining = {
 
   // ── 固定 URL 模板（使用者看不到，也不用输）────────────────────────────
   trainUrl: (trainId) => `${BASE}/training/${trainId}`,
-  courseUrl: (courseId) => `${BASE}/teacherTraining/courseIndex?courseId=${courseId}`,
+  // 必须是 courseDetail（详情页才有播放器）。2026-09 曾误改成 courseIndex，
+  // 结果 357 个资源的课程一个 <video> 都找不到，挂课全程卡死 —— 别改回去。
+  courseUrl: (courseId) => `${BASE}/teacherTraining/courseDetail?courseId=${courseId}`,
 
   /**
    * 内置专题目录。

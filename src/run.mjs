@@ -42,7 +42,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launchContext, reusePage, loginState, gotoWithRetry } from './browser.mjs';
+import { launchContext, reusePage, loginState, gotoWithRetry, clearSiteSession } from './browser.mjs';
+import { saveAccount, clearAccount, maskUserId } from './account.mjs';
 import {
   fetchSeason,
   fetchTrainPeriods,
@@ -95,6 +96,26 @@ const MIN_SECTION_WATCH_SEC = 120;
 const STALL_RELOAD_SEC = 180;
 /** 单节课内最多自愈几次；超过就放弃并报警，避免 reload 死循环把 deadline 耗光 */
 const MAX_STALL_RELOADS = 3;
+
+/**
+ * 打开课程页后，多久仍未出现 <video> 就「放弃本课、换下一门」。
+ *
+ * ★ 只在【本课一次都没见过视频】时生效（见 watchCourse），所以不会误伤
+ *   「上一节播完、下一节还没挂上」的空档。
+ * 依据：真登录 + 页面正常时播放器 6~10s 就挂上；超过 2.5 分钟基本就是：
+ *   · 未登录被重定向  · 课程页结构变了  · 该课全是 PDF/问卷这类非视频资源
+ * 旧行为是一直干等到 deadline（可能几小时）—— 无人值守时最贵的一个坑。
+ */
+const NO_VIDEO_GIVEUP_SEC = 150;
+/**
+ * 检测到答题弹窗后，等多久还不消失就放弃本课。
+ * 无头模式下人根本没法作答，干等没意义；但真人在有头模式里可能正作答，所以给足 5 分钟。
+ */
+const QUESTION_GIVEUP_SEC = 300;
+
+/** Node fetch 的瞬时可恢复网络错误（与 src/courses.mjs 里的 TRANSIENT_FETCH 同义，那边不导出） */
+const TRANSIENT_FETCH_RE =
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR|socket hang up|fetch failed|network|TLS/i;
 /**
  * reload 后必须真的越过卡住点这么远，才算「恢复了」、才允许把自愈配额归零。
  *
@@ -120,12 +141,14 @@ export function stallRecovered(stuckAt, currentTime) {
 
 const OPTS = {
   login: has('login'),
+  // 切换账号：先清掉 profile 里的旧登录态，再进登录页（--login 的加强版）
+  switchAccount: has('switch-account'),
   // 挂课类型（站点适配器 id）。只有一个时不用传；将来多个类型时由 UI/配置决定。
   site: arg('site'),
   list: has('list'),
   // 无头已是默认（实测 Widevine 可用，见 src/browser.mjs 的 ignoreDefaultArgs 注释）
-  // --headful 退回有头；--login 必须有头（要手动输账号）
-  headless: !has('headful') && !has('login'),
+  // --headful 退回有头；--login / --switch-account 必须有头（要手动输账号）
+  headless: !has('headful') && !has('login') && !has('switch-account'),
   dryRun: has('dry-run'),
   autoNext: !has('no-next'),
   keepThrottled: has('keep-throttled'),
@@ -148,7 +171,13 @@ const site = getSite(OPTS.site);
 
 // ---------- 输出 ----------
 const t0 = Date.now();
-const stamp = () => new Date().toISOString().slice(11, 19);
+// 本地时间 HH:MM:SS。★ 旧实现用 toISOString()（UTC），日志里显示的比本机时间少 8 小时，
+// 看着像「时间和实际对不上」。改用本地时区，和界面/CLI 看到的一致。
+const stamp = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 const log = (...a) => console.log(`[${stamp()}]`, ...redactArgs(a));
 const warn = (...a) => console.warn(`[${stamp()}] ⚠️ `, ...redactArgs(a));
 
@@ -347,6 +376,10 @@ async function watchCourse(page, course, deadline, budget = {}) {
   const courseBudgetSec = budget.courseBudgetSec ?? Infinity;
   const globalBudgetSec = budget.globalBudgetSec ?? Infinity;
   const globalEarnedSec = budget.globalEarnedSec ?? 0;
+  // 预算达成后要等本节播完 → 允许自动延长本课 deadline（除非用户用 --per-course-min 显式封顶）
+  const allowDeadlineExtend = budget.allowDeadlineExtend ?? true;
+  let effectiveDeadline = deadline;
+  let deadlineExtended = false;
   // 平台侧目标：本课「已学习学时」到这个数就算认定到位。
   // 比本地秒数权威 —— 已认定 = min(已学习, max_period)，本地多挂平台也不会再涨。
   const platformTargetPeriod = budget.platformTargetPeriod ?? null;
@@ -381,6 +414,8 @@ async function watchCourse(page, course, deadline, budget = {}) {
   let warnedStall = false;
   let warnedStallHard = false; // 自愈配额用尽后的「放弃」只喊一次
   let warnedNoVideo = false;
+  let warnedQuestion = false;   // 答题弹窗告警只喊一次
+  let questionSince = null;     // 弹窗开始时刻（消失则清空）
   // 「等本节播完」状态机：学时挂够 ≠ 立刻切课
   let pendingStop = null;      // 'course_budget_met' | 'target_met' | 'platform_met'
   let endedAtBudget = null;    // 挂够那一刻的 activity_ended_count
@@ -389,7 +424,7 @@ async function watchCourse(page, course, deadline, budget = {}) {
   let lastEndedCount = null;     // 上一帧看到的 activity_ended_count（检测跨活动边界）
   let overshootCap = null;       // 挂够那一刻定下的等待上限（见 decideStop 里的注释）
 
-  while (Date.now() < deadline) {
+  while (Date.now() < effectiveDeadline) {
     const s = await readState(page);
 
     if (!s) { await page.waitForTimeout(3000); continue; }
@@ -415,11 +450,54 @@ async function watchCourse(page, course, deadline, budget = {}) {
     if (s.hasVideo) {
       rec.videoSeen = true;
       noVideoSince = Date.now();
-    } else if (Date.now() - noVideoSince > 60_000 && !warnedNoVideo) {
-      warnedNoVideo = true;
-      warn(`已 60s 未找到视频 —— 最可能是【还没登录】，或页面结构变了（课程：${course.title}）`);
-      warn('  用界面：点「先登录（只需一次）」；用命令行：npm run login。');
-      rec.notes.push('60s 内未出现 video 元素');
+    } else {
+      const noVideoSec = Math.round((Date.now() - noVideoSince) / 1000);
+      if (!warnedNoVideo && noVideoSec > 60) {
+        warnedNoVideo = true;
+        warn(
+          `已 ${noVideoSec}s 未找到视频 —— 最可能是【还没登录】、课程页结构变了，` +
+            `或该课都是非视频资源（课程：${course.title}）`,
+        );
+        warn('  用界面：先点「先登录（只需一次）」再重试；用命令行：npm run login。');
+        rec.notes.push(`${noVideoSec}s 内未出现 video 元素`);
+      }
+      // ★ 只在【本课一次都没见过视频】时才放弃，避免误伤「节与节之间的空档」；
+      //   旧行为是一直干等到 deadline（可能几小时）。
+      if (!rec.videoSeen && noVideoSec >= NO_VIDEO_GIVEUP_SEC) {
+        const skipNote = s.resource_skips ? `（已跳过 ${s.resource_skips} 个非视频资源）` : '';
+        const msg = `本课已 ${noVideoSec}s 完全没有视频${skipNote} —— 放弃本课，换下一门`;
+        warn(msg);
+        rec.notes.push(msg);
+        rec.outcome = 'no_video';
+        break;
+      }
+    }
+
+    // ---- 答题弹窗：无头下人没法作答，必须显式告警 + 有上限地放弃 ----
+    //      旧版只在页面内部 renderPanel 提示，宿主/界面完全看不到 → 看着就像「无缘无故卡住」。
+    if (s.question_modal) {
+      questionSince ??= Date.now();
+      if (!warnedQuestion) {
+        warnedQuestion = true;
+        warn(
+          `检测到【答题弹窗】—— 视频会卡在这里（课程：${course.title}）。` +
+            `有头模式下请在浏览器里作答；无头模式下无法作答，` +
+            `${Math.round(QUESTION_GIVEUP_SEC / 60)} 分钟后会自动跳过本课。`,
+        );
+        if (s.question_text) warn(`  题目片段：${s.question_text}`);
+        rec.notes.push('出现答题弹窗，等待人工作答');
+      }
+      if (Date.now() - questionSince >= QUESTION_GIVEUP_SEC * 1000) {
+        const msg =
+          `答题弹窗持续 ${Math.round((Date.now() - questionSince) / 1000)}s 未处理` +
+          ` —— 放弃本课，换下一门`;
+        warn(msg);
+        rec.notes.push(msg);
+        rec.outcome = 'question_blocked';
+        break;
+      }
+    } else {
+      questionSince = null;
     }
 
     rec.pauseBlocked = s.paused_blocked;
@@ -444,6 +522,25 @@ async function watchCourse(page, course, deadline, budget = {}) {
     overshootCap = d.state.overshootCap;
     const endedCount = d.endedCount;
     if (d.onSet) rec.notes.push(d.onSet);
+
+    // ---- 预算达成后要等本节播完（平台按整节记账）→ 必须把 deadline 延到够等完 ----
+    // 旧行为：deadline 只按「预算 ÷ 倍速 × 1.8 + 2 分钟」算。长节（如 8326s）会在播完前
+    // 就被 timeout 掐掉，本节白挂（实测差 ~14 分钟）。这里一次性延长到 overshootCap 足够，
+    // 之后不再重复延长（否则每帧顺延 → 永不超时）。
+    if (allowDeadlineExtend && !deadlineExtended && pendingStop) {
+      deadlineExtended = true;
+      if (typeof overshootCap === 'number' && Number.isFinite(overshootCap)) {
+        const needMs = (overshootCap / OPTS.rate) * 1000 + 120_000;
+        const want = Date.now() + needMs;
+        if (want > effectiveDeadline) {
+          log(
+            `  学时已够、需等本节播完 → 本课截止时间自动延长约 ${Math.round(needMs / 60000)} 分钟` +
+              `（否则长节播完前被掐断，本节白挂）`,
+          );
+          effectiveDeadline = want;
+        }
+      }
+    }
 
     if (s.platform_watched_sec !== null && s.platform_watched_sec !== undefined) {
       if (lastPlatform !== null && s.platform_watched_sec > lastPlatform) {
@@ -601,6 +698,76 @@ async function watchCourse(page, course, deadline, budget = {}) {
   return rec;
 }
 
+/**
+ * 被 Web UI 拉起时，等待用户完成登录。
+ *
+ * ★ 已经登录、且不是「切换账号」→ 直接收工（调用方随后会把账号落盘，界面即可显示）。
+ *   想换账号请走独立的「切换账号」入口 —— 它会先清掉旧登录态，所以能正常等到新登录。
+ *   只有「切换账号」才要求「先退旧 → 再登新」。
+ *
+ * 用户随时可以关掉窗口 —— 那不是错误，返回 { closed: true } 让调用方安静退出。
+ *
+ * @param {import('playwright-core').Page} page
+ * @param {import('playwright-core').BrowserContext} context
+ * @param {{switching?: boolean}} [o]
+ * @returns {Promise<{ok:boolean, closed?:boolean, timeout?:boolean}>}
+ */
+async function waitForBrowserLogin(page, context, { switching = false } = {}) {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  let closed = false;
+  context.on('close', () => {
+    closed = true;
+  });
+
+  // 窗口/标签关掉后 evaluate 会抛异常 —— 视作「窗口关闭」，不是程序错误
+  const read = async () => {
+    if (closed) return null;
+    try {
+      return await loginState(page);
+    } catch {
+      return null;
+    }
+  };
+
+  let ls = await read();
+  if (!ls) return { ok: false, closed: true };
+
+  // 已经是登录态、且不是「切换账号」→ 没什么要等的：直接收工。
+  // （调用方随后会把账号落盘；想换账号请用独立的「切换账号」）
+  if (ls.loggedIn && !switching) return { ok: true, already: true };
+
+  if (ls.loggedIn) {
+    // switching 且清完仍是登录态：只能请用户手动退出（正常清干净时不会走到这）
+    warn('清除旧登录态后仍检测到已登录 —— 请在窗口里点右上角头像 →「退出登录」，再用新账号登录。');
+  } else {
+    log('请在弹出的浏览器窗口里完成登录 —— 登录成功后会自己继续，不用回来按键。');
+  }
+
+  // 要求「先退出、再登录成功」才算完成：即使旧态没清干净，也不会一弹出就关闭
+  let sawLogout = !ls.loggedIn;
+
+  let lastNudge = 0;
+  while (Date.now() < deadline) {
+    if (closed) return { ok: false, closed: true };
+    // ★ 不因 switching 而直接放行：清除旧登录态后应看到 loggedIn=false（sawLogout=true），
+    //   再登新账号才返回成功。这样即使 clearSiteSession 没清干净，也会等用户手动退出，
+    //   而不是又「一弹出就关闭」。
+    if (ls.loggedIn && sawLogout) return { ok: true };
+    if (!ls.loggedIn) sawLogout = true;
+
+    await page.waitForTimeout(3000).catch(() => {});
+    ls = await read();
+    if (!ls) return { ok: false, closed: true };
+
+    if (!ls.loggedIn && Date.now() - lastNudge > 60_000) {
+      lastNudge = Date.now();
+      const left = Math.max(0, Math.round((deadline - Date.now()) / 60000));
+      log(`还没检测到登录…… 请扫码/输入账号密码（最长再等 ${left} 分钟）`);
+    }
+  }
+  return { ok: false, timeout: true };
+}
+
 // ---------- 主流程 ----------
 async function main() {
   if (!fs.existsSync(ENGINE_PATH)) {
@@ -611,8 +778,9 @@ async function main() {
   //
   //   用户可以直接把浏览器地址栏里的链接粘进来 —— 两种形状都认：
   //     专题：https://basic.smartedu.cn/training/<trainId>
-  //     单课：https://basic.smartedu.cn/teacherTraining/courseIndex?courseId=<id>
-  //           （courseDetail?courseId= 同样认；train 列表页给的就是后者）
+  //     单课：https://basic.smartedu.cn/teacherTraining/courseDetail?courseId=<id>
+  //           （必须是 courseDetail —— 详情页才有 <video>；
+  //             courseIndex 只是落地页，引擎找不到视频会一直卡在 00:00）
   //   --train 显式走专题，--course/--url 自动识别（专题链接也认）。
   let targets = [];
   let resolvedTrainId = null; // 平台驱动学时核对要用；单课/季节模式下为 null
@@ -765,8 +933,20 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
 
   const page = await reusePage(context);
 
-  // 3) 登录 / 校验登录态
-  if (OPTS.login) {
+  // 3) 登录 / 切换账号 / 校验登录态
+  if (OPTS.login || OPTS.switchAccount) {
+    // 切换账号：先把旧登录态从 profile 里清掉。
+    // 不清的话浏览器一打开就带着旧账号，而下面的等待逻辑一看到「已登录」就收工，
+    // 窗口刚弹出就被关掉 —— 这正是「想换账号却换不了」的根因。
+    if (OPTS.switchAccount) {
+      log('切换账号：清除本地保存的旧登录态（cookie + localStorage）…');
+      await gotoWithRetry(page, 'https://basic.smartedu.cn/', { label: '首页' });
+      await clearSiteSession(context, page);
+      // 缓存的 userId 也必须清 —— 否则界面会拿旧账号的 userId 去读旧账号的进度
+      clearAccount(site.id);
+      log('旧登录态已清除。');
+    }
+
     await gotoWithRetry(page, 'https://basic.smartedu.cn/', { label: '登录页' });
 
     // 两种使用场景：
@@ -781,21 +961,13 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
         process.stdin.once('data', resolve);
       });
     } else {
-      log('请在弹出的浏览器窗口里完成登录 —— 登录成功后会自己继续，不用回来按键。');
-      const deadline = Date.now() + 10 * 60 * 1000;
-      let lastNudge = 0;
-      let ls = await loginState(page);
-      while (!ls.loggedIn && Date.now() < deadline) {
-        await page.waitForTimeout(3000);
-        if (Date.now() - lastNudge > 60_000) {
-          lastNudge = Date.now();
-          const left = Math.max(0, Math.round((deadline - Date.now()) / 60000));
-          log(`还没检测到登录…… 请扫码/输入账号密码（最长再等 ${left} 分钟）`);
-        }
-        ls = await loginState(page);
+      const r = await waitForBrowserLogin(page, context, { switching: OPTS.switchAccount });
+      if (r.closed) {
+        log('浏览器窗口已被关闭，登录流程结束。');
+        return;
       }
-      if (!ls.loggedIn) {
-        warn('等满 10 分钟仍未登录，先关闭。重新打开再试即可。');
+      if (!r.ok) {
+        warn('等满 10 分钟仍未检测到新登录，先关闭。重新打开再试即可。');
         await context.close();
         process.exit(1);
       }
@@ -807,6 +979,25 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
     //   里面了（`ND_UC_AUTH-<uuid>&ncet-xedu&token`、`aiAssistant_audio_<user_id>`），
     //   而它是裸 `console.log`、绕过了 log()/warn() 的脱敏出口 —— 实测真泄到了界面与日志。
     //   上一行的 signals 已经足以表达「登录判据命中了什么」，键名列表纯属冗余，故删除。
+
+    // ★ 顺手把 userId 落盘：界面的「账号与进度」卡片靠它纯 Node 读各课进度。
+    //   登录页本身不带 trainId，所以去内置的第一个专题页，等平台自己发进度请求。
+    const tid = Array.isArray(site.catalog) ? site.catalog[0] : null;
+    if (ls.loggedIn && tid) {
+      try {
+        const boot = await fetchTrainPeriods(page, tid, {
+          url: site.trainUrl(tid),
+          timeoutMs: 20_000,
+        });
+        if (boot?.userId) {
+          saveAccount(site.id, { userId: boot.userId, trainId: tid });
+          log(`已记录账号 ${maskUserId(boot.userId)} —— 回到界面就能看到账号与各课进度`);
+        }
+      } catch {
+        // 抓不到不影响登录本身；下次挂课时还会再抓一次
+      }
+    }
+
     await context.close();
     return;
   }
@@ -872,7 +1063,9 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
     const boot = await fetchTrainPeriods(page, trainId, { url: site.trainUrl(trainId) });
     if (boot) {
       platformUserId = boot.userId;
-      log(`平台 user_id = ${platformUserId}`);
+      // 落盘给界面用（纯 Node 读进度只需 userId，不必再开浏览器）
+      saveAccount(site.id, { userId: platformUserId, trainId });
+      log(`平台 user_id = ${maskUserId(platformUserId)}`);
       const cert = site.certify(targets, boot.map);
       periodRows = cert;
       platformSec = periodToSec(cert.certifiedTotal);
@@ -950,6 +1143,8 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
       // max_period 有上限 → 挂到上限即认定到位；无上限 → 挂到「已学习 + 本次预算」
       platformTargetPeriod: maxP > 0 ? maxP : learned + secToPeriod(courseBudgetSec),
       minSectionSec: OPTS.minSectionSec,
+      // --per-course-min 是用户显式设的硬上限 → 不允许被“等本节播完”自动延长
+      allowDeadlineExtend: OPTS.perCourseMin <= 0,
     });
     rec.learnedPeriodBefore = learned;
 
@@ -1009,6 +1204,17 @@ if (isEntry) {
       // 预检/占用类错误已经是给人看的中文了，不要再糊一屏 Node 堆栈
       console.error(`\n${e.message}\n`);
       process.exit(3);
+    }
+    // 网络类失败：重试 4 次仍不通（代理切节点 / 网络抖动）→ 给小白一句「再点一次就行」
+    const netMsg = `${e?.cause?.code || e?.code || ''} ${e?.cause?.message || e?.message || e}`;
+    if (TRANSIENT_FETCH_RE.test(netMsg)) {
+      warn('拉取课程列表时网络中断 —— 常见原因：代理（如 Clash）没开/正在切节点，或网络抖动。');
+      warn('  确认代理已开启、网络正常后，直接再点一次「开始挂课」即可；不必重装或改设置。');
+      warn(`  技术细节：${String(netMsg).trim().split('\n')[0]}`);
+      try {
+        saveReport();
+      } catch {}
+      process.exit(1);
     }
     console.error('运行失败：', e);
     try {

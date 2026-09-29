@@ -35,6 +35,48 @@ const HEADERS = {
     'Chrome/153.0.0.0 Safari/537.36',
 };
 
+/**
+ * 瞬时可恢复的网络错误（Node fetch）。
+ * 浏览器导航已经有 gotoWithRetry，但这里之前是裸 fetch —— 一次 TLS 抖动就把整轮跑死：
+ * 实测 2026-09-29 11:05 报 `ECONNRESET: Client network socket disconnected before secure
+ * TLS connection was established`，整轮 0ms 退出（多半是 Clash 在切节点）。
+ */
+const TRANSIENT_FETCH =
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR|socket hang up|fetch failed|network|TLS/i;
+
+/**
+ * 带指数退避的 fetch。
+ * 只重试**瞬时**错误（TLS/连接/超时/5xx/429）；4xx 是确定性错误，立即抛出不浪费你 4 次超时。
+ *
+ * @param {string} url
+ * @param {{label?:string, headers?:object, attempts?:number, baseDelayMs?:number}} [o]
+ * @returns {Promise<Response>}
+ */
+async function fetchWithRetry(url, { label = '接口', headers = HEADERS, attempts = 4, baseDelayMs = 1200 } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, { headers });
+      // 5xx / 429 通常是瞬时的；其余 4xx 是确定的 —— 不重试
+      if (res.status < 500 && res.status !== 429) return res;
+      lastErr = new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      lastErr = err;
+      const msg = `${err?.cause?.code || err?.code || ''} ${err?.cause?.message || err?.message || err}`;
+      if (!TRANSIENT_FETCH.test(msg)) throw err;
+    }
+    if (i < attempts) {
+      const delay = baseDelayMs * 2 ** (i - 1);
+      console.warn(
+        `  ↻ 拉取${label}遇到瞬时网络错误（第 ${i}/${attempts} 次）：` +
+          `${lastErr?.cause?.code || lastErr?.message || lastErr}；${delay}ms 后重试…`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 /** 递归挖出所有长得像课程的节点 —— 接口结构随季节变动，写死字段名会随时失效 */
 function harvest(node, out = [], depth = 0) {
   if (!node || depth > 6) return out;
@@ -71,7 +113,7 @@ function harvest(node, out = [], depth = 0) {
 }
 
 async function pull(url, label) {
-  const res = await fetch(url, { headers: HEADERS });
+  const res = await fetchWithRetry(url, { label });
   if (!res.ok) throw new Error(`拉取${label}失败：HTTP ${res.status} ${url}`);
   const raw = await res.json();
   const courses = harvest(raw);
@@ -101,7 +143,7 @@ async function pull(url, label) {
  */
 export async function fetchTrainMeta(trainId) {
   const url = `${STATIC_BASE}/${encodeURIComponent(trainId)}.json`;
-  const res = await fetch(url, { headers: HEADERS });
+  const res = await fetchWithRetry(url, { label: `专题元数据 ${trainId}` });
   if (!res.ok) throw new Error(`拉取专题元数据失败：HTTP ${res.status} ${url}`);
   const raw = await res.json();
   const t = raw?.train ?? {};
@@ -136,8 +178,12 @@ export async function fetchSeason(seasonalCode) {
 export async function fetchTrainCourses(trainId) {
   const url = `${STATIC_BASE}/${encodeURIComponent(trainId)}/train_courses.json`;
   const { raw, courses } = await pull(url, `专题 ${trainId}`);
-  // 有 maxPeriod 的排前面：这些是能真正计入专题学时的课
-  courses.sort((a, b) => (Number(b.maxPeriod) || -99) - (Number(a.maxPeriod) || -99));
+  // ★ 不再自定义排序：一律保持平台给的**自然顺序**。
+  //   曾经这里按 max_period 降序排（注释写的是「有 maxPeriod 的排前面」），
+  //   但平台**本来就**把有上限的课排在无上限的课前面，额外排序反而把
+  //   「上限 3 的数智素养提升」顶到了「上限 2 的大力弘扬教育家精神」前面，
+  //   与用户在专题页看到的顺序/直觉不符。保持自然顺序即可。
+  //   若将来某个专题把「不限」的课排在前面、需要保底，再加 stable 分区，别用降序。
   return { trainId, raw, courses };
 }
 
@@ -174,7 +220,7 @@ export function parseTrainId(input) {
  *
  * 判据优先看 URL 形状（最可靠）：
  *   …/training/<uuid>                  → train
- *   …?courseId=<uuid>（courseIndex / courseDetail 都一样） → course
+ *   …?courseId=<uuid>（courseDetail 才有播放器；courseIndex 只是落地页） → course
  * 只给一个裸 UUID 时两者分不清，就拿专题接口探一下：
  *   拉得到课程列表就是专题，否则当课程。（专题接口对课程 id 会 404）
  *

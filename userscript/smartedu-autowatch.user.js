@@ -58,6 +58,9 @@
     nextDelayMs: 2500,        // 结束后等多久再点下一节（留给上报时间）
     autoDismissModal: true,   // 自动点"我知道了/确定"这类确认弹窗
     autoAnswerQuestion: false,// 自动答题（默认关：答题多半计分，脚本不该替你决定答案）
+    // 点开一个课件后，多久仍没出现 <video> 就判定「非视频资源」（PDF/问卷）并换下一个。
+    // 旧版会一直重复点同一个条目 → 永远等不到视频，这就是「卡住」的根因之一。
+    resourceProbeMs: 30_000,
 
     // --- M4 学时核对 ---
     watchNetwork: true,
@@ -132,6 +135,13 @@
     userPaused: false,
     userIntentUntil: 0,
     finished: false,
+    // ── 给宿主（run.mjs）看的「异常原因」信号 ──
+    questionModal: false,     // 是否存在答题弹窗（无头下人没法作答 → 宿主据此告警/放弃）
+    questionText: '',
+    resourceSkips: 0,         // 本页跳过了几个「点开却没视频」的非视频资源
+    skippedIdx: {},           // 已判定为非视频资源的条目下标（本页有效，换页清空）
+    __autoIdx: -1,            // 上次自动点开的条目下标（-1 = 无）
+    __autoAt: 0,
     startedAt: Date.now(),
   };
   window.__SMARTEDU_AUTOWATCH__ = { config: CONFIG, state: S, dump: dumpRecon, snapshot };
@@ -170,6 +180,10 @@
       really_hidden: reallyHidden(),
       user_paused: S.userPaused,
       finished: S.finished,
+      // 异常信号：宿主据此决定「告警 / 放弃本课」
+      question_modal: !!S.questionModal,
+      question_text: S.questionText,
+      resource_skips: S.resourceSkips,
       fake_visibility: CONFIG.fakeVisibility,
     };
   }
@@ -531,27 +545,48 @@
 
   /**
    * 自动开场：页面加载完但还没有 <video> 时，点开第一个未完成的课件。
-   * 没这一步就只能「打开课程页 → 干等」，永远不开始播。
-   * 20s 窗口兜底：点完若 20s 内视频仍未出现，说明该条目有问题，允许再点一次；
-   * 但只要视频已经在就立即退避，绝不跟播放中的页面抢控制权。
+   *
+   * ★ 非视频资源（PDF / 问卷）必须能跳过：点开后若 CONFIG.resourceProbeMs 内始终
+   *   没有 <video>，就把它记进 skippedIdx、换下一个未完成项。
+   *   旧版会一直重复点同一个条目（20s 一次），永远等不到视频 —— 实测卡死的根因之一。
    */
   function autoStart() {
     if (S.finished || S.userPaused || !CONFIG.autoNext) return;
-    if (video()) return;                       // 已经在播，别碰
+    if (video()) { S.__autoIdx = -1; return; }   // 已经在播：清掉待判定项，别跟播放中的页面抢
     const items = collectItems();
     if (!items.length) return;
-    const idx = items.findIndex((el) => !isDone(el));
+
+    // 上一轮点开的条目迟迟不出视频 → 判为非视频资源，跳过
+    if (S.__autoIdx >= 0 && Date.now() - S.__autoAt >= CONFIG.resourceProbeMs) {
+      const cur = items[S.__autoIdx];
+      if (cur && !video()) {
+        S.skippedIdx[S.__autoIdx] = 1;
+        S.resourceSkips++;
+        log(
+          `第 ${S.__autoIdx + 1}/${items.length} 节 ${Math.round(CONFIG.resourceProbeMs / 1000)}s 内无视频，` +
+            `判定为非视频资源，跳过：${labelOf(cur)}`,
+        );
+        S.__autoIdx = -1;
+      }
+    }
+    if (S.__autoIdx >= 0) return;               // 还在等上一个条目出视频
+
+    const idx = items.findIndex((el, i) => !isDone(el) && !S.skippedIdx[i]);
     if (idx < 0) {
       S.finished = true;
-      log('目录里已无未完成项');
+      log('目录里已无未完成项（可跳过的非视频资源已跳过）');
       renderPanel(`本页全部完成 · 拦截 pause ${S.pauseBlocked} 次`);
       return;
     }
-    if (S.__autoIdx === idx && Date.now() - S.__autoAt < 20_000) return;
     S.__autoIdx = idx;
     S.__autoAt = Date.now();
     log(`自动开场：第 ${idx + 1}/${items.length} 节 ${labelOf(items[idx])}`);
-    try { items[idx].click(); } catch { /* 元素被重建则下轮再试 */ }
+    try {
+      items[idx].click();
+    } catch {
+      // 元素被重建：本轮不算数，下轮重来（不推进 __autoAt，免得误判成非视频资源）
+      S.__autoIdx = -1;
+    }
   }
 
   function applyRate(v) {
@@ -604,6 +639,11 @@
   function startPageLoop() {
     native.setInterval.call(window, () => {      // 弹窗
       const qOpt = q1(SEL.questionOption);
+      // 把「有没有答题弹窗」同步给宿主（无头下人没法作答，宿主据此告警/放弃）
+      S.questionModal = !!qOpt;
+      S.questionText = qOpt
+        ? (qOpt.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+        : '';
       if (qOpt && !CONFIG.autoAnswerQuestion) {
         // 只在第一次提示，避免刷屏
         if (!S.__qNotified) {
@@ -639,6 +679,7 @@
         S.finished = false;
         S.__qNotified = false;
         S.__autoIdx = -1;
+        S.skippedIdx = {};
         setTimeout(expandAllGroups, 1500);
       }
 
