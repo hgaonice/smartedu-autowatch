@@ -132,7 +132,7 @@
   <div class="card">
     <div class="step"><span class="num">3</span>设置 <span class="hint">不确定的话，保持默认就好</span></div>
     <div class="row">
-      <div class="field"><label>目标学时</label><input type="number" id="hours" value="10" min="1" max="200" step="0.5"></div>
+      <div class="field"><label>目标学时</label><input type="number" id="hours" value="14" min="1" max="200" step="0.5"></div>
       <div class="field"><label>播放倍速</label><input type="number" id="rate" value="2" min="1" max="16" step="0.5"></div>
       <div class="field"><label><input type="checkbox" id="headful" style="accent-color:var(--accent)"> 显示浏览器窗口</label></div>
     </div>
@@ -236,7 +236,10 @@ async function loadTargets() {
   const first = targets.find((t) => t.available);
   if (first) {
     $('target').value = first.id;
-    if (first.maxPeriod) $('hours').value = first.maxPeriod;
+    // ★ 不再用专题的官方要求学时覆盖「目标学时」输入框。
+    //   平台要求（如 2026 专题 = 10 学时）已由 showMeta() 以「目标 N 学时」标签展示，
+    //   信息不会丢；而输入框是**用户自己的目标**，应保持默认值（现为 14），
+    //   不该每次选专题都被冲回平台要求值。
   }
   showMeta();
   await loadCourses();

@@ -61,6 +61,13 @@
     // 点开一个课件后，多久仍没出现 <video> 就判定「非视频资源」（PDF/问卷）并换下一个。
     // 旧版会一直重复点同一个条目 → 永远等不到视频，这就是「卡住」的根因之一。
     resourceProbeMs: 30_000,
+    // ★ 首次进入专题课程页会弹「学习指南」模态框，不关掉就点不出播放器（video 永远为 0）。
+    //   它有两个坑：① 按钮是「点一次解锁、再点一次才关」的连点式；
+    //              ② 关掉后平台把「下次不再提示」写进 localStorage
+    //                 `teacher-train-introduction-pop-<trainId> = 'popWindown'`。
+    //   所以最干净的压制方式是在页面脚本运行前就把这个键写好 —— 弹窗压根不出现。
+    //   （实测：预设该键后弹窗不再出现、video 正常挂载；清掉该键则弹窗必现、video 恒为 0）
+    skipIntroPopup: true,
 
     // --- M4 学时核对 ---
     watchNetwork: true,
@@ -459,6 +466,12 @@
     rateValue: ['.vjs-playback-rate-value'],
     modalConfirm: ['.fish-modal-confirm-btns .fish-btn', '[class*="modal-confirm"] .fish-btn',
                    '[class*="modalConfirm"] .fish-btn'],
+    // ★ 学习指南弹窗的按钮实测形态（2026-09）：
+    //   <div class="index-module_btnDisable_ZuSJF">我知道了</div>
+    //   类名是 CSS Modules 哈希，且含 "Disable" 字样（需点两次解锁+确认），
+    //   所以按**文本**匹配，不看类名。容器是 .fish-modal。
+    modalAny: ['.fish-modal', '[class*="modal-"]', '[class*="Dialog"]'],
+    modalDismissText: ['我知道了', '确定', '知道了', '明白', '关闭'],
     footerBtn: ['[class*="index-module_footer"] .fish-btn', '[class*="footer"] .fish-btn'],
     questionOption: ['.nqti-option', '[class*="nqti-option"]', '[class*="question"] [class*="option"]'],
   };
@@ -544,6 +557,87 @@
   }
 
   /**
+   * 从 URL / 配置里取当前专题 trainId —— 用于压制「学习指南」弹窗。
+   *
+   * 两个来源：① 宿主（Playwright）注入的 CONFIG.trainId；② 油猴模式下从 URL 反查
+   * （课程页 URL 的 query 里没有 trainId，但页面里「专题」链接是 /training/<trainId>，
+   *  从页面找一个即可）。
+   */
+  function currentTrainId() {
+    if (CONFIG.trainId) return CONFIG.trainId;
+    try {
+      const a = document.querySelector('a[href*="/training/"]');
+      const href = a && a.getAttribute('href');
+      const m = href && href.match(/\/training\/([0-9a-fA-F-]{16,})/);
+      if (m) return m[1];
+    } catch {}
+    return null;
+  }
+
+  /**
+   * 压制「学习指南」弹窗。
+   *
+   * 为什么要压制而不是「出现后再关」：这个弹窗是两个坑叠起来的 ——
+   *   · 按钮 `.index-module_btnDisable_*` 是【连点式】：点一次只解锁，再点一次才关；
+   *   · 不关掉它，页面上点「开始学习」/点目录项都无效，`<video>` 永远不出现。
+   * 而平台关闭后会把标记写进 localStorage：
+   *     `teacher-train-introduction-pop-<trainId> = 'popWindown'`
+   * 之后就不再弹。所以我们直接在 document-start 把这个键写好，等于「预置已读」，
+   * 弹窗压根不出现 —— 比事后去找按钮点两次稳得多（按钮类名是哈希，改版就变）。
+   *
+   * 实测（登录态）：预设该键后弹窗不再出现、video 正常挂载；
+   * 清掉该键则弹窗必现、video 一直为 0。
+   */
+  function suppressIntroPopup() {
+    if (!CONFIG.skipIntroPopup) return;
+    const trainId = currentTrainId();
+    if (!trainId) return;
+    const key = `teacher-train-introduction-pop-${trainId}`;
+    try {
+      // 只在「未设置」时写入，不覆盖用户已有值（避免把 'popWindown' 改成别的）
+      if (!localStorage.getItem(key)) {
+        localStorage.setItem(key, 'popWindown');
+        log(`已预设「学习指南」弹窗忽略标记（${key}=popWindown）`);
+      }
+    } catch { /* 隐私模式 / 存储被禁时静默 */ }
+  }
+
+  /**
+   * 兜底：万一弹窗还是出现了（预设失败、平台改键名、或别的模态），把可见的
+   * 「我知道了 / 确定」类按钮点掉。
+   *
+   * ★ 必须连点两次：实测该按钮是「先解锁再确认」的连点式，且**合成 click 有效**
+   *   （平台对这类弹窗没做 isTrusted 校验 —— 与「开始学习」按钮的情况不同）。
+   */
+  function dismissBlockingModal() {
+    if (!CONFIG.autoDismissModal) return false;
+    const modal = q1(SEL.modalAny);
+    if (!modal) return false;
+    // 只在确实可见时动手
+    if (modal.offsetParent === null && modal.getClientRects().length === 0) return false;
+
+    // 按**文本**找「我知道了」这类按钮（不看哈希类名）；只要叶子节点，避免点到包裹层
+    const btns = [...modal.querySelectorAll('button, div, a, span')].filter((el) => {
+      if (el.children.length > 0) return false;
+      const t = (el.innerText || '').trim();
+      return SEL.modalDismissText.includes(t);
+    });
+    if (!btns.length) return false;
+
+    const btn = btns[0];
+    const label = (btn.innerText || '').trim();
+    try {
+      btn.click();
+      // 连点式按钮：间隔很短再点一次，第二次才能真正关闭
+      setTimeout(() => { try { btn.click(); } catch {} }, 250);
+      if (S.recon) log(`[侦察] 关闭阻挡弹窗：点了「${label}」×2`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * 自动开场：页面加载完但还没有 <video> 时，点开第一个未完成的课件。
    *
    * ★ 非视频资源（PDF / 问卷）必须能跳过：点开后若 CONFIG.resourceProbeMs 内始终
@@ -553,6 +647,9 @@
   function autoStart() {
     if (S.finished || S.userPaused || !CONFIG.autoNext) return;
     if (video()) { S.__autoIdx = -1; return; }   // 已经在播：清掉待判定项，别跟播放中的页面抢
+    // ★ 有模态框挡着时，点任何东西都无效（实测：学习指南弹窗在时点目录项毫无反应），
+    //   所以先试着把它关掉再谈点课程。
+    if (dismissBlockingModal()) return;
     const items = collectItems();
     if (!items.length) return;
 
@@ -656,6 +753,9 @@
       if (CONFIG.autoAnswerQuestion && qOpt) { try { qOpt.click(); log('已自动选择答案'); } catch {} }
 
       if (CONFIG.autoDismissModal) {
+        // 先走「学习指南」这类模态的兜底（按文本找按钮、连点两次）
+        dismissBlockingModal();
+        // 保留原有 fish-btn 类名的通用关闭
         const btn = q1(SEL.modalConfirm);
         if (btn) { try { btn.click(); log('已关闭确认弹窗'); } catch {} }
       }
@@ -1116,12 +1216,17 @@
   installEventBlocker();
   installPauseHook();
   installNetworkSniffer();      // 也要早于页面发请求
+  // ★ 宿主注入模式下 trainId 在 document-start 就有，这时预设弹窗标记最有效
+  //   （能赶在平台 JS 决定「要不要弹学习指南」之前）。
+  suppressIntroPopup();
 
   function boot() {
     installUserIntentDetector();
     installThrottleGuards();
     startResumeLoop();
     startPageLoop();
+    // 油猴模式下 trainId 得从 DOM 反查，所以 DOM 就绪后再试一次
+    suppressIntroPopup();
     setTimeout(() => {
       expandAllGroups();
       renderPanel();
