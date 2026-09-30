@@ -314,15 +314,66 @@ export async function reusePage(context) {
  * 判断是否已登录。
  * 坑：_X_STAT_EVENT_SESSION / sajssdk_* 这类埋点键含 "session""user"，
  * 用宽泛正则会误报为已登录，所以：先排黑名单，再要强信号（token/ticket/jwt，或值像 JWT）。
+ *
+ * ★ 导航竞态必须自己兜住：`page.evaluate` 在页面正在跳转时会抛
+ *   「Execution context was destroyed」。登录过程中的轮询（run.mjs 的 while 循环）
+ *   每 3s 读一次，正好会撞上用户扫码后平台跳转的那一两帧 —— 实测已因此把整个
+ *   `--login` 打崩、浏览器被一起关掉，用户白登录一次。
+ *   这里改成「读不到就重试几次，仍失败则返回 loggedIn=false + note」，
+ *   让调用方继续轮询，而不是把异常抛到顶层。
  */
-export async function loginState(page) {
+export async function loginState(page, { attempts = 4, retryDelayMs = 800 } = {}) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await readLoginStateOnce(page);
+    } catch (err) {
+      const msg = String(err?.message || err);
+      // 只对「上下文被销毁/页面正在导航」这类瞬时错误重试；其它错误照样抛
+      const transient = /Execution context was destroyed|Cannot find context|Target closed|frame was detached|navigat/i.test(msg);
+      if (!transient || i === attempts) {
+        if (!transient) throw err;
+        return {
+          keys: [],
+          cookieNames: [],
+          signals: [],
+          loggedIn: false,
+          note: `页面正在导航，登录态本次读取失败（${msg.split('\n')[0]}）`,
+        };
+      }
+      await page.waitForTimeout(retryDelayMs);
+    }
+  }
+}
+
+/** 单次读取登录态（不做重试，导航期间会抛异常） */
+function readLoginStateOnce(page) {
   return page.evaluate(() => {
-    const DENY = /^_X_STAT|sajssdk|^ND_UC_|^ai_assistant|_guest|^__utm|^Hm_|_ga$/i;
+    // ★ 黑名单只排「埋点/设备类」键，**不能**用 `^ND_UC_` 一刀切：
+    //   真实登录凭据键正是 `ND_UC_AUTH-<uuid>&ncet-xedu&token`，前缀同为 `ND_UC_`，
+    //   用 `^ND_UC_` 会把它连真凭据一起误杀 → 已登录却判成未登录。
+    //   实测踩到：该键被排除后 signals 为空，无头跑批直接 process.exit(2)「未登录」。
+    //   所以这里只精确排除设备键 `ND_UC_DEVICE_ID`。
+    const DENY = /^_X_STAT|sajssdk|^ND_UC_DEVICE_ID|^ai_assistant|_guest|^__utm|^Hm_|_ga$/i;
     const STRONG = /token|ticket|jwt|access_?key|user_?info|passport|auth/i;
+
+    // ★★ 登录页会「凭空」造出一个假登录信号，必须排掉（实测 2026-09）：
+    //   打开 auth.smartedu.cn/uias/login 后**什么都不做**，它就已经写好了
+    //   `ND_UC_AUTH-<uuid>&ncet-xedu&token`（936B，是页面的临时缓存，不是真凭据）。
+    //   而按名字匹配 `auth` 的正则会把它当成「已登录」→ 程序立刻关浏览器 →
+    //   用户连账号都还没输，主站的登录态从未建立 → 换个账号永远失败。
+    //   判据必须落在【主站】上的【用户绑定标记】，而不是登录页的缓存键。
+    const onLoginPage = /(^|\.)auth\.smartedu\.cn$/i.test(location.host)
+      || /\/uias\//.test(location.pathname);
 
     const keys = [];
     const strongHits = [];
+    const userBound = [];
     let jwtLike = null;
+    // 用户绑定标记：只有真正登录主站后平台才会写（登录页没有）。
+    //   ① 固定的用户态键名；② 键名里嵌着 11~12 位 userId 的键（如
+    //   `X-EUD-WEB-INCENTIVES-452654053800`、`personalCenter:MyCourses-452654053800`）。
+    const USER_KEY = /^X-EDU-WEB-(USER|ROLE)$/i;
+    const USER_ID_IN_KEY = /(?:^|[^0-9])\d{11,12}(?:[^0-9]|$)/;
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -330,20 +381,39 @@ export async function loginState(page) {
         if (DENY.test(k)) continue;
         const v = String(localStorage.getItem(k) ?? '');
         if (STRONG.test(k)) strongHits.push(k);
+        if (USER_KEY.test(k) || USER_ID_IN_KEY.test(k)) userBound.push(k);
         if (!jwtLike && /^eyJ[A-Za-z0-9_-]{10,}\./.test(v.replace(/^"|"$/g, ''))) jwtLike = k;
       }
     } catch {}
 
     const cookieNames = document.cookie.split(';').map((s) => s.trim().split('=')[0]).filter(Boolean);
     const cookieHits = cookieNames.filter((k) => !DENY.test(k) && STRONG.test(k));
+    // cookie 里的用户态标记（真登录才有；登录页实测没有）
+    const userCookie = cookieNames.filter((k) => USER_KEY.test(k));
 
-    const signals = [...strongHits, ...cookieHits, ...(jwtLike ? [jwtLike + '(JWT)'] : [])];
+    // 判定：必须有【用户绑定标记】（localStorage 或 cookie）才算已登录。
+    //   只有泛化的 token 类键名（会被登录页伪造）而没有任何用户绑定标记时，
+    //   **且当前就在登录页** → 判为未登录，继续等用户真正输完账号。
+    const boundSignals = [...userBound, ...userCookie];
+    const loggedIn = boundSignals.length > 0
+      || (!onLoginPage && (strongHits.length > 0 || cookieHits.length > 0 || !!jwtLike));
+
+    const signals = [...boundSignals, ...strongHits, ...cookieHits, ...(jwtLike ? [jwtLike + '(JWT)'] : [])];
+    let note = '';
+    if (!loggedIn) {
+      note = onLoginPage
+        ? '停在登录页（未完成登录）'
+        : signals.length ? '仅命中非用户绑定的键，判定为未登录' : '未命中登录标记';
+    }
     return {
       keys,
       cookieNames,
       signals,
-      loggedIn: signals.length > 0 || !!jwtLike,
-      note: signals.length ? '' : '仅命中埋点键，判定为未登录',
+      userBound: boundSignals,
+      onLoginPage,
+      host: location.host,
+      loggedIn,
+      note,
     };
   });
 }
@@ -356,24 +426,54 @@ export async function loginState(page) {
  * cookie 决定 UC_TOKEN，localStorage 里也存着 auth 键，只清一边仍可能被判为已登录。
  * 该 profile 只服务这一个站点，所以整体清空是安全的。
  *
+ * ★★ 必须清【多个 origin】，不能只清 basic.smartedu.cn（实测踩到）：
+ *   localStorage 是**按域名隔离**的。平台的登录态分散在两个域上 ——
+ *     · basic.smartedu.cn   主站
+ *     · auth.smartedu.cn    登录页（uias）
+ *   而 `--switch-account` 原来只在主站上清了一次 localStorage，登录页那个域没清到。
+ *   后果：换账号时点「登录」跳到 auth.smartedu.cn，登录页读到自己域里**残留的旧登录
+ *   标记**，判定「已登录」→ 立刻把你弹回首页 —— 用户看到的就是「点登录又跳回首页」，
+ *   完全没法换号。清 cookie 也救不了，因为残留的是 localStorage 而不是 cookie。
+ *   所以这里逐个 origin 走一遍，把各自的 localStorage/sessionStorage 都清掉。
+ *
  * @param {import('playwright-core').BrowserContext} context
  * @param {import('playwright-core').Page} page 需要已停在平台域名下（localStorage 按 origin 隔离）
+ * @param {string[]} [origins] 需要清理的域（默认覆盖主站与登录页）
  */
-export async function clearSiteSession(context, page) {
+export async function clearSiteSession(context, page, origins = DEFAULT_CLEAR_ORIGINS) {
+  // 先清 cookie（HTTP 层，与 origin 无关，一次就够）
+  await context.clearCookies();
+
+  // 再逐个 origin 清 Web Storage —— localStorage/sessionStorage 按域名隔离，
+  // 只清当前页所在域是不够的（这就是「换账号被弹回首页」的根因）。
+  for (const origin of origins) {
+    try {
+      await page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.evaluate(() => {
+        try { localStorage.clear(); } catch {}
+        try { sessionStorage.clear(); } catch {}
+      });
+    } catch {
+      // 某个域名打不开（网络抖动/页面被关）不该让整个切换账号失败；
+      // cookie 已清，且下面的主站清理由调用方保证。
+    }
+  }
+  // 兜底：调用方传进来的 page 当前所在域再清一次（origins 可能没覆盖到）
   try {
     await page.evaluate(() => {
-      try {
-        localStorage.clear();
-      } catch {}
-      try {
-        sessionStorage.clear();
-      } catch {}
+      try { localStorage.clear(); } catch {}
+      try { sessionStorage.clear(); } catch {}
     });
   } catch {
     // 页面可能已经关了；cookie 清掉也足够退出登录
   }
-  await context.clearCookies();
 }
+
+/** 平台登录态所在的 origin（Web Storage 按域隔离，切换账号必须逐个清） */
+export const DEFAULT_CLEAR_ORIGINS = [
+  'https://basic.smartedu.cn/',
+  'https://auth.smartedu.cn/',
+];
 
 // ----------------------------------------------------------------
 // 瞬时可恢复的网络错误

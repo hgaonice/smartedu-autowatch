@@ -24,7 +24,7 @@
  *   --headless          无头运行（已是默认，实测 Widevine 可用）
  *   --headful           退回有头
  *   --rate 2            倍速，默认 2
- *   --target-hours 10   目标学时，默认 10
+ *   --target-hours 14   目标学时，默认 14
  *   --no-next           不自动下一节（只挂当前这一节）
  *   --max-courses 3     限制本次最多挂几门课（试跑用）
  *   --dry-run           只列出将要挂的课程，不启动浏览器
@@ -156,7 +156,7 @@ const OPTS = {
   course: arg('course'), // --url 的别名，语义更清楚；两者等价
   season: arg('season'),
   train: arg('train'),
-  targetHours: Number(arg('target-hours', 10)) || 10,
+  targetHours: Number(arg('target-hours', 14)) || 14,
   rate: Number(arg('rate', 2)) || 2,
   maxCourses: Number(arg('max-courses', 0)) || 0,
   perCourseMin: Number(arg('per-course-min', 0)) || 0,
@@ -454,11 +454,16 @@ async function watchCourse(page, course, deadline, budget = {}) {
       const noVideoSec = Math.round((Date.now() - noVideoSince) / 1000);
       if (!warnedNoVideo && noVideoSec > 60) {
         warnedNoVideo = true;
-        warn(
-          `已 ${noVideoSec}s 未找到视频 —— 最可能是【还没登录】、课程页结构变了，` +
-            `或该课都是非视频资源（课程：${course.title}）`,
-        );
-        warn('  用界面：先点「先登录（只需一次）」再重试；用命令行：npm run login。');
+        // ★ 别再一上来就说「最可能是还没登录」：登录态早在进入本流程前就确认过了
+        //   （未登录会在上面 exit 2），把嫌疑指向登录会把排查带偏。实测真因是
+        //   「学习指南」弹窗挡住播放器，按可能性列出全部原因。
+        warn(`已 ${noVideoSec}s 未找到视频（课程：${course.title}）—— 常见原因：`);
+        warn('  ① 首次进入专题被「学习指南」弹窗挡住（引擎会自动预设忽略标记并兜底关闭，');
+        warn('     若仍失败，看日志里有没有「已预设…弹窗忽略标记」）；');
+        warn('  ② 该课都是非视频资源（PDF/问卷），引擎会逐个跳过；');
+        warn('  ③ 课程页结构又变了（目录/播放器选择器失效）；');
+        warn('  ④ 登录态其实已失效（可先点「先登录」重登一次再试）。');
+        warn('  可用界面「显示浏览器窗口」跑一次，人眼确认卡在哪一步。');
         rec.notes.push(`${noVideoSec}s 内未出现 video 元素`);
       }
       // ★ 只在【本课一次都没见过视频】时才放弃，避免误伤「节与节之间的空档」；
@@ -847,7 +852,7 @@ async function main() {
     const { courses } = await fetchSeason(OPTS.season);
     targets = courses;
     log(`共 ${courses.length} 门课程`);
-  } else if (!OPTS.login) {
+  } else if (!OPTS.login && !OPTS.switchAccount) {
     console.log(`
 用法：
   node src/run.mjs --list                         ★列出可挂专题（免登录，不碰浏览器）
@@ -947,7 +952,11 @@ ${SITES.map((s) => `  ${s.id.padEnd(18)} ${s.name}  —— ${s.hint}`).join('\n'
       log('旧登录态已清除。');
     }
 
-    await gotoWithRetry(page, 'https://basic.smartedu.cn/', { label: '登录页' });
+    // 打开主站首页。清完登录态后首页会显示「登录」入口，用户点它即进登录页。
+    // ★ 为什么不用 `auth.smartedu.cn/uias/login` 直接开登录页：登录成功后平台是否
+    //   一定跳回主站、以及登录态检测能否在登录页域上成立，都依赖平台行为，
+    //   换账号这种关键流程不宜引入未验证的假设。首页入口是已验证可用的路径。
+    await gotoWithRetry(page, 'https://basic.smartedu.cn/', { label: '首页（点右上角「登录」）' });
 
     // 两种使用场景：
     //   · 终端里跑 → 等按 Enter（传统行为，兼容现有习惯）

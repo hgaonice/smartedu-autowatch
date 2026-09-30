@@ -151,7 +151,7 @@ npm run watch -- --season 2025sqpx                   # 季节码（2025 及以�
 | 参数 | 说明 |
 | --- | --- |
 | `--train <trainId>` | ★ 按专题挂，自动凑够学时（推荐） |
-| `--target-hours 10` | 目标学时，默认 10 |
+| `--target-hours 14` | 目标学时，默认 14 |
 | `--login` | 只开浏览器手动登录（强制有头） |
 | `--url <URL或courseId>` | 挂单个课程（页内自动下一节） |
 | `--season 2025sqpx` | 按季节码遍历（2025 及以前） |
